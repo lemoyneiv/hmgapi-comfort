@@ -879,4 +879,191 @@ public final class ComfortPolicy {
             pending = false;
         }
     }
+
+    /** Default cold-boot deferral window (ms after sys.boot_completed=1) before starting ComfortService/climate. */
+    public static final long COLD_BOOT_RUNWAY_MS = 12_000L;
+
+    /**
+     * True when the vehicle is in a silent parked wake or Mobis dark standby where neither the
+     * startup notice dismisser nor background cabin/IPC polling should run:
+     *  - Never true when BCM Ignition ({@code ignOn == 1}) is ON (active drive, Utility Mode, or plugged-in IG ON).
+     *  - True when OpenLink's dark-standby marker ({@code /dev/.openlink-bt}) is present.
+     *  - True when Mobis BlackScreen or AV-PowerOff ({@code mobisSleeping == 1}) is active.
+     *  - True when OEM Micom power status is OFF (2), DELAY_MODE (6), or PREPARING_OFF (7) unless
+     *    the display is confirmed awake ({@code mobisSleeping == 0}, e.g. driver entry welcome screen).
+     */
+    public static boolean isSilentParkedStandby(
+            boolean openLinkBtMarker, int powerStatus, int mobisSleeping, int ignOn) {
+        if (ignOn == 1) {
+            return false;
+        }
+        if (openLinkBtMarker) {
+            return true;
+        }
+        if (mobisSleeping == 1) {
+            return true;
+        }
+        if (powerStatus == 2 || powerStatus == 6 || powerStatus == 7) {
+            return mobisSleeping != 0;
+        }
+        return false;
+    }
+
+    /**
+     * True once the post-boot_completed AA/CarPlay connection runway has completed, OR wireless
+     * projection is already established, OR the owner opened the Comfort UI directly.
+     */
+    public static boolean isColdBootRunwayReady(
+            long nowMs,
+            long bootReadyAtMs,
+            long runwayWaitMs,
+            boolean projectionConnected,
+            boolean uiForeground) {
+        if (uiForeground || projectionConnected || runwayWaitMs <= 0L) {
+            return true;
+        }
+        return nowMs - bootReadyAtMs >= runwayWaitMs;
+    }
+
+    /**
+     * Parses Linux {@code /proc/net/tcp} or {@code /proc/net/tcp6} text for an ESTABLISHED ({@code 01})
+     * Wireless Android Auto / Connectivity SoftAP ({@code 192.168.43.1} -> {@code 012BA8C0}) or
+     * Wireless CarPlay ({@code 192.168.49.1} -> {@code 0131A8C0}) session.
+     */
+    public static boolean isProjectionTcpEstablished(String procNetTcp) {
+        if (procNetTcp == null || procNetTcp.isEmpty()) {
+            return false;
+        }
+        int len = procNetTcp.length();
+        int lineStart = 0;
+        while (lineStart < len) {
+            int nl = procNetTcp.indexOf('\n', lineStart);
+            int lineEnd = nl < 0 ? len : nl;
+            if (isProjectionTcpLine(procNetTcp, lineStart, lineEnd)) {
+                return true;
+            }
+            lineStart = lineEnd + 1;
+        }
+        return false;
+    }
+
+    private static boolean isProjectionTcpLine(String s, int start, int end) {
+        // Columns: sl local_address rem_address st ...
+        int p = skipSpaces(s, start, end);
+        if (p >= end || s.charAt(p) == 's') return false;   // header "sl ..."
+        p = skipNonSpaces(s, p, end);
+        p = skipSpaces(s, p, end);
+        int locStart = p;
+        int locEnd = skipNonSpaces(s, locStart, end);
+        p = skipSpaces(s, locEnd, end);
+        p = skipNonSpaces(s, p, end);   // rem_address
+        p = skipSpaces(s, p, end);
+        int stStart = p;
+        int stEnd = skipNonSpaces(s, stStart, end);
+        if (stEnd - stStart != 2 || s.charAt(stStart) != '0' || s.charAt(stStart + 1) != '1') {
+            return false;
+        }
+        int colon = -1;
+        for (int i = locStart; i < locEnd; i++) {
+            if (s.charAt(i) == ':') {
+                colon = i;
+                break;
+            }
+        }
+        if (colon < locStart + 8) return false;
+        String hostHex = s.substring(locStart, colon).toUpperCase(Locale.US);
+        return hostHex.endsWith("012BA8C0") || hostHex.endsWith("0131A8C0");
+    }
+
+    private static int skipSpaces(String s, int i, int end) {
+        while (i < end && s.charAt(i) <= ' ') i++;
+        return i;
+    }
+
+    private static int skipNonSpaces(String s, int i, int end) {
+        while (i < end && s.charAt(i) > ' ') i++;
+        return i;
+    }
+
+    /** Checks live {@code /proc/net/tcp} and {@code /proc/net/tcp6} for an active projection TCP socket. */
+    public static boolean isProjectionTcpConnected() {
+        return isProjectionTcpEstablished(readSmallTextFile("/proc/net/tcp"))
+                || isProjectionTcpEstablished(readSmallTextFile("/proc/net/tcp6"));
+    }
+
+    /**
+     * Zero-IPC check against {@code /data/hmgapi/public/state.json} (world-readable since HMG-API 1.0.0):
+     * returns {@code true} ONLY when {@code mods.<modId>.enabled} is explicitly {@code false}.
+     */
+    public static boolean isModDisabledInPublicState(String stateJson, String modId) {
+        if (stateJson == null || stateJson.isEmpty() || modId == null || modId.isEmpty()) {
+            return false;
+        }
+        int modsIdx = stateJson.indexOf("\"mods\"");
+        if (modsIdx < 0) return false;
+        String needle = "\"" + modId + "\"";
+        int idIdx = stateJson.indexOf(needle, modsIdx + 6);
+        if (idIdx < 0) return false;
+        int braceStart = stateJson.indexOf('{', idIdx + needle.length());
+        if (braceStart < 0) return false;
+        int depth = 0;
+        boolean inStr = false;
+        boolean esc = false;
+        int braceEnd = -1;
+        for (int i = braceStart; i < stateJson.length(); i++) {
+            char c = stateJson.charAt(i);
+            if (inStr) {
+                if (esc) {
+                    esc = false;
+                } else if (c == '\\') {
+                    esc = true;
+                } else if (c == '"') {
+                    inStr = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                inStr = true;
+            } else if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    braceEnd = i;
+                    break;
+                }
+            }
+        }
+        if (braceEnd < 0) return false;
+        String modBlock = stateJson.substring(braceStart, braceEnd + 1);
+        int enIdx = modBlock.indexOf("\"enabled\"");
+        if (enIdx < 0) return false;
+        int colon = modBlock.indexOf(':', enIdx + 9);
+        if (colon < 0) return false;
+        int v = skipSpaces(modBlock, colon + 1, modBlock.length());
+        return modBlock.startsWith("false", v);
+    }
+
+    static String readSmallTextFile(String path) {
+        java.io.File f = new java.io.File(path);
+        if (!f.isFile()) return "";
+        java.io.FileInputStream in = null;
+        try {
+            in = new java.io.FileInputStream(f);
+            byte[] buf = new byte[32768];
+            int total = 0;
+            while (total < buf.length) {
+                int n = in.read(buf, total, buf.length - total);
+                if (n <= 0) break;
+                total += n;
+            }
+            return total <= 0 ? "" : new String(buf, 0, total, "UTF-8");
+        } catch (Throwable ignored) {
+            return "";
+        } finally {
+            if (in != null) {
+                try { in.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
 }

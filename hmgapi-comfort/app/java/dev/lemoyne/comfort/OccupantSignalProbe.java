@@ -49,6 +49,11 @@ public final class OccupantSignalProbe {
         void onWake();
     }
 
+    public interface StandbySignalSource extends SignalSource {
+        int readPowerStatusFast();
+        int readIgnStatusFast();
+    }
+
     /**
      * Live front-passenger seat occupancy snapshot from Gen5W HSCAN & SYSTEM services:
      *  - HSCAN.getOccupancy: 1 = unoccupied / solo driver, 2 = front passenger occupied
@@ -574,6 +579,26 @@ public final class OccupantSignalProbe {
         }
     }
 
+    public int readPowerStatusFast() {
+        try {
+            if (source instanceof StandbySignalSource) {
+                return ((StandbySignalSource) source).readPowerStatusFast();
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    public int readIgnStatusFast() {
+        try {
+            if (source instanceof StandbySignalSource) {
+                return ((StandbySignalSource) source).readIgnStatusFast();
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
     public void onWake() {
         try {
             source.onWake();
@@ -608,6 +633,7 @@ public final class OccupantSignalProbe {
         private final OccupantSignalProbe probe;
         private final ServerSocket serverSocket;
         private volatile boolean running = true;
+        private volatile long lastClientNano = 0L;
 
         public LoopbackServer(OccupantSignalProbe probe, int port) throws IOException {
             this.probe = probe;
@@ -616,6 +642,13 @@ public final class OccupantSignalProbe {
 
         public int getLocalPort() {
             return serverSocket.getLocalPort();
+        }
+
+        public long msSinceLastClient() {
+            long last = lastClientNano;
+            if (last == 0L) return Long.MAX_VALUE;
+            long elapsed = (System.nanoTime() - last) / 1_000_000L;
+            return elapsed < 0L ? 0L : elapsed;
         }
 
         public void start() {
@@ -659,6 +692,7 @@ public final class OccupantSignalProbe {
         }
 
         private void handleClient(Socket client) throws IOException {
+            lastClientNano = System.nanoTime();
             DataInputStream in = new DataInputStream(new BufferedInputStream(client.getInputStream(), 256));
             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(client.getOutputStream(), 512));
             String cmd = readFrame(in);
@@ -755,12 +789,16 @@ public final class OccupantSignalProbe {
 
     // ---- Reflection-Backed Gen5W OEM Service Signal Source ----
 
-    static final class ReflectionGen5wSignalSource implements SignalSource {
+    static final class ReflectionGen5wSignalSource implements StandbySignalSource {
 
         private static final String HCAN_JAR = "/system/framework/com.hkmc.ext.hcan.jar";
 
         private final PushTelemetrySource pushSource;
         private boolean pushAwake = true;
+
+        private boolean standbyInitialized;
+        private boolean standbyServicesReady;
+        private long lastStandbyInitMs;
 
         private boolean initialized;
         private boolean coreServicesReady;
@@ -775,6 +813,7 @@ public final class OccupantSignalProbe {
         private BoundGetter bgBlackScreenShown;
         private BoundGetter bgAvPowerOff;
         private BoundGetter bgDisplayOffMode;
+        private BoundGetter bgPowerStatus;
         private BoundGetter bgBcmDrvSeatOpt;
         private BoundGetter bgBcmAstSeatOpt;
         private BoundGetter bgBcmRlSeatOpt;
@@ -896,10 +935,22 @@ public final class OccupantSignalProbe {
 
         @Override
         public synchronized int readMobisSleepingFast() {
-            ensureInitialized();
+            ensureStandbyBound();
             int black = invokeIntGetter(bgBlackScreenShown, -1);
             int avOff = invokeIntGetter(bgAvPowerOff, -1);
             return CabinState.computeMobisSleeping(black, avOff);
+        }
+
+        @Override
+        public synchronized int readPowerStatusFast() {
+            ensureStandbyBound();
+            return invokeIntGetter(bgPowerStatus, -1);
+        }
+
+        @Override
+        public synchronized int readIgnStatusFast() {
+            ensureStandbyBound();
+            return invokeIntGetter(bgBcmIgnStatus, -1);
         }
 
         @Override
@@ -927,13 +978,63 @@ public final class OccupantSignalProbe {
             return fallback;
         }
 
+        /**
+         * Lightweight standby binder init used by {@link WelcomeDaemon} during cold boot and
+         * dark/silent wakes: binds only {@code BCM}, {@code BLACKSCREEN}, and {@code POWER}
+         * without opening {@code /system/framework/com.hkmc.ext.hcan.jar} or touching HSCAN/USM/DATC.
+         */
+        private void ensureStandbyBound() {
+            long now = System.currentTimeMillis();
+            if ((initialized && coreServicesReady)
+                    || (standbyInitialized && (standbyServicesReady || now - lastStandbyInitMs < 5000L))) {
+                return;
+            }
+            standbyInitialized = true;
+            lastStandbyInitMs = now;
+            try {
+                Class<?> smClass = Class.forName("android.os.ServiceManager");
+                Method getService = smClass.getMethod("getService", String.class);
+                Class<?> ibinderClass = Class.forName("android.os.IBinder");
+
+                Class<?> carSvc = null;
+                try {
+                    carSvc = Class.forName("com.hkmc.Service");
+                } catch (Throwable ignored) {}
+
+                BoundService bcm = bindKnownService(getService, ibinderClass, carSvc,
+                        "BCM_SERVICE", "com.hkmc.micom.bcm", "com.hkmc.bcm.IBCMService", null);
+                if (bcm != null) {
+                    bgBcmIgnStatus = bindGetter(bcm, "getIGNStatus");
+                }
+
+                BoundService blackScreen = bindDescriptorService(
+                        getService, ibinderClass, carSvc, "BLACKSCREEN_SERVICE");
+                if (blackScreen != null) {
+                    bgBlackScreenShown = bindGetter(blackScreen, "isBlackScreenShown");
+                }
+
+                BoundService power = bindDescriptorService(
+                        getService, ibinderClass, carSvc, "POWER_SERVICE");
+                if (power != null) {
+                    bgAvPowerOff = bindGetter(power, "isAvPowerOff");
+                    bgDisplayOffMode = bindGetter(power, "isDisplayOffMode");
+                    bgPowerStatus = bindGetter(power, "getPowerStatus");
+                }
+
+                standbyServicesReady = (bcm != null && power != null);
+            } catch (Throwable ignored) {
+            }
+        }
+
         private void ensureInitialized() {
             long now = System.currentTimeMillis();
             if (initialized && (coreServicesReady || now - lastInitAttemptMs < 5000L)) {
                 return;
             }
             initialized = true;
+            standbyInitialized = true;
             lastInitAttemptMs = now;
+            lastStandbyInitMs = now;
             bgHscanOccupancy = null;
             bgSysClassStatus = null;
             bgAsstBelt = null;
@@ -943,6 +1044,7 @@ public final class OccupantSignalProbe {
             bgBlackScreenShown = null;
             bgAvPowerOff = null;
             bgDisplayOffMode = null;
+            bgPowerStatus = null;
             bgBcmDrvSeatOpt = null;
             bgBcmAstSeatOpt = null;
             bgBcmRlSeatOpt = null;
@@ -1019,7 +1121,7 @@ public final class OccupantSignalProbe {
                 bgDatcIgn3Status = bindGetter(datc, "isIGN3Status");
                 bgDatcTempUnit = bindGetter(datc, "getTemperatureUnit");
 
-                // 6. BLACKSCREEN & POWER (Mobis QuickBoot sleep & Display-Off detection)
+                // 6. BLACKSCREEN & POWER (Mobis QuickBoot sleep, power status & Display-Off detection)
                 BoundService blackScreen = bindDescriptorService(
                         getService, ibinderClass, carSvc, "BLACKSCREEN_SERVICE");
                 bgBlackScreenShown = bindGetter(blackScreen, "isBlackScreenShown");
@@ -1028,7 +1130,9 @@ public final class OccupantSignalProbe {
                         getService, ibinderClass, carSvc, "POWER_SERVICE");
                 bgAvPowerOff = bindGetter(power, "isAvPowerOff");
                 bgDisplayOffMode = bindGetter(power, "isDisplayOffMode");
+                bgPowerStatus = bindGetter(power, "getPowerStatus");
 
+                standbyServicesReady = (bcm != null && power != null);
                 coreServicesReady = (bcm != null && hscan != null);
             } catch (Throwable ignored) {
             }

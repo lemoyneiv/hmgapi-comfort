@@ -679,6 +679,92 @@ public final class ComfortPolicyTest {
                 "Passenger detected (30°C): passenger vent medium -> seat_vent passenger medium",
                 metricBoarding.summary + " -> " + actions(metricBoarding.actions));
 
+        // 24. Cold-boot projection runway, silent dark-standby gating, /proc/net/tcp & public state.json
+        check("Silent standby: ignOn=1 never suppresses comfort even if OpenLink marker or blackscreen",
+                false, ComfortPolicy.isSilentParkedStandby(true, 6, 1, 1));
+        check("Silent standby: OpenLink /dev/.openlink-bt marker suppresses parked silent wake",
+                true, ComfortPolicy.isSilentParkedStandby(true, -1, 0, 0));
+        check("Silent standby: Mobis BlackScreen/AV-Off (mobisSleeping=1, ignOn=0) is silent",
+                true, ComfortPolicy.isSilentParkedStandby(false, 1, 1, 0));
+        check("Silent standby: Micom DELAY_MODE (6) with unknown screen (-1) is silent",
+                true, ComfortPolicy.isSilentParkedStandby(false, 6, -1, 0));
+        check("Silent standby: Micom DELAY_MODE (6) with confirmed awake screen (0) allows welcome dismiss",
+                false, ComfortPolicy.isSilentParkedStandby(false, 6, 0, 0));
+        check("Silent standby: normal driver entry (power=1, mobisSleeping=0, ignOn=0) is active",
+                false, ComfortPolicy.isSilentParkedStandby(false, 1, 0, 0));
+
+        check("Cold-boot runway: waits while < 12 s and no projection/UI",
+                false, ComfortPolicy.isColdBootRunwayReady(15_000L, 10_000L, ComfortPolicy.COLD_BOOT_RUNWAY_MS, false, false));
+        check("Cold-boot runway: ready at >= 12 s even without phone",
+                true, ComfortPolicy.isColdBootRunwayReady(22_000L, 10_000L, ComfortPolicy.COLD_BOOT_RUNWAY_MS, false, false));
+        check("Cold-boot runway: ready immediately when AA/CarPlay TCP is connected",
+                true, ComfortPolicy.isColdBootRunwayReady(12_000L, 10_000L, ComfortPolicy.COLD_BOOT_RUNWAY_MS, true, false));
+        check("Cold-boot runway: ready immediately when Comfort UI is opened",
+                true, ComfortPolicy.isColdBootRunwayReady(11_000L, 10_000L, ComfortPolicy.COLD_BOOT_RUNWAY_MS, false, true));
+
+        String tcpListenAndLoopback =
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt\n"
+                + "   0: 0100007F:8BE5 0100007F:C350 01 00000000:00000000 00:00000000 00000000\n"
+                + "   1: 012BA8C0:149D 00000000:0000 0A 00000000:00000000 00:00000000 00000000\n";
+        check("/proc/net/tcp: loopback ESTABLISHED and 192.168.43.1 LISTEN (0A) do not count as projection",
+                false, ComfortPolicy.isProjectionTcpEstablished(tcpListenAndLoopback));
+        String tcpAaEst = tcpListenAndLoopback
+                + "   2: 012BA8C0:149D 142BA8C0:D431 01 00000000:00000000 00:00000000 00000000\n";
+        check("/proc/net/tcp: 192.168.43.1 ESTABLISHED (01) detects Wireless AA session",
+                true, ComfortPolicy.isProjectionTcpEstablished(tcpAaEst));
+        String tcpCpIpv6 =
+                "  sl  local_address                         remote_address                        st\n"
+                + "   0: 0000000000000000FFFF00000131A8C0:1B58 0000000000000000FFFF00000A31A8C0:C001 01\n";
+        check("/proc/net/tcp6: IPv4-mapped 192.168.49.1 ESTABLISHED detects Wireless CarPlay session",
+                true, ComfortPolicy.isProjectionTcpEstablished(tcpCpIpv6));
+
+        String pubEnabled = "{\"mods\":{\"other\":{\"enabled\":false},\"hmgapi-comfort\":{\"enabled\":true,\"settings\":{\"note\":\"a}b\"}}}}";
+        String pubDisabled = "{\"mods\":{\"other\":{\"enabled\":true},\"hmgapi-comfort\":{\"settings\":{\"note\":\"{x}\"},\"enabled\": false}}}";
+        check("Public state.json: enabled=true is not disabled",
+                false, ComfortPolicy.isModDisabledInPublicState(pubEnabled, "hmgapi-comfort"));
+        check("Public state.json: enabled=false after nested settings braces is detected",
+                true, ComfortPolicy.isModDisabledInPublicState(pubDisabled, "hmgapi-comfort"));
+
+        OccupantSignalProbe plainProbe = new OccupantSignalProbe(new OccupantSignalProbe.SignalSource() {
+            @Override public OccupantSignalProbe.PassengerPresence readPassengerPresence() { return soloEmpty; }
+            @Override public OccupantSignalProbe.CabinState readCabinState() { return OccupantSignalProbe.CabinState.UNAVAILABLE; }
+            @Override public int readMobisSleepingFast() { return 0; }
+            @Override public void onWake() {}
+        });
+        check("Plain SignalSource defaults readPowerStatusFast/readIgnStatusFast to -1",
+                "-1/-1", plainProbe.readPowerStatusFast() + "/" + plainProbe.readIgnStatusFast());
+
+        OccupantSignalProbe standbyProbe = new OccupantSignalProbe(new OccupantSignalProbe.StandbySignalSource() {
+            @Override public OccupantSignalProbe.PassengerPresence readPassengerPresence() { return soloEmpty; }
+            @Override public OccupantSignalProbe.CabinState readCabinState() { return OccupantSignalProbe.CabinState.UNAVAILABLE; }
+            @Override public int readMobisSleepingFast() { return 1; }
+            @Override public int readPowerStatusFast() { return 6; }
+            @Override public int readIgnStatusFast() { return 0; }
+            @Override public void onWake() {}
+        });
+        check("StandbySignalSource exposes power=6 and ign=0",
+                "6/0/1",
+                standbyProbe.readPowerStatusFast() + "/"
+                        + standbyProbe.readIgnStatusFast() + "/"
+                        + standbyProbe.readMobisSleepingFast());
+        try {
+            OccupantSignalProbe.LoopbackServer hbSrv = new OccupantSignalProbe.LoopbackServer(standbyProbe, 0);
+            hbSrv.start();
+            try {
+                check("LoopbackServer.msSinceLastClient starts at Long.MAX_VALUE",
+                        Long.MAX_VALUE, hbSrv.msSinceLastClient());
+                OccupantSignalProbe.LoopbackClient hbCli =
+                        new OccupantSignalProbe.LoopbackClient(hbSrv.getLocalPort(), plainProbe);
+                hbCli.queryCabinState();
+                check("LoopbackServer.msSinceLastClient updates on client query",
+                        true, hbSrv.msSinceLastClient() < 5000L);
+            } finally {
+                hbSrv.stop();
+            }
+        } catch (Exception e) {
+            check("LoopbackServer msSinceLastClient test threw no exception", "none", e.toString());
+        }
+
         System.exit(fail);
     }
 }

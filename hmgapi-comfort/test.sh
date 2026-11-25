@@ -38,13 +38,13 @@ check "hmgapi-comfort attributed solely to lemoyneiv" "lemoyneiv" \
     "$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["authors"]))' "$M/mod.json")"
 
 install_mod "$B"
-cp -r "$M/icons" "$M/svc" "$R/data/hmgapi/mods/hmgapi-comfort/"
+cp -r "$M/icons" "$R/data/hmgapi/mods/hmgapi-comfort/"
 
 eng plan
 check "engine plan succeeds" 0 "$rc"
 has "plan lists Comfort.apk" "dev.lemoyne.comfort (app/Comfort.apk)" "$out"
-has "plan lists fast-path welcome daemon as system at boot" "service  hmgapi-comfort/welcome as system, at boot, restarted if it stops" "$out"
-has "plan lists non-root starter service as system" "service  hmgapi-comfort/starter as system, at android" "$out"
+has "plan lists fast-path welcome daemon as system at android" "service  hmgapi-comfort/welcome as system, at android, restarted if it stops" "$out"
+check "plan omits removed starter shell service" no "$(echo "$out" | grep -q 'hmgapi-comfort/starter' && echo yes || echo no)"
 check "plan has zero problems" no "$(echo "$out" | grep -q '^problem ' && echo yes || echo no)"
 
 eng apply
@@ -52,8 +52,8 @@ check "engine apply succeeds" 0 "$rc"
 has "mod published as on" "1 of 1 mods on" "$out"
 has "mod in public state.json" '"hmgapi-comfort"' "$(cat "$R/data/hmgapi/public/state.json")"
 check "no ComfortProbe USB folder registered in usb.txt" no "$(grep -q 'ComfortProbe' "$R/data/hmgapi/state/usb.txt" 2>/dev/null && echo yes || echo no)"
-has "welcome daemon registered in services.txt at boot" "hmgapi-comfort welcome system boot yes jar app/Comfort.apk dev.lemoyne.comfort.WelcomeDaemon" "$(cat "$R/data/hmgapi/state/services.txt")"
-has "starter registered in services.txt as system" "hmgapi-comfort starter system android no script svc/start.sh -" "$(cat "$R/data/hmgapi/state/services.txt")"
+has "welcome daemon registered in services.txt at android" "hmgapi-comfort welcome system android yes jar app/Comfort.apk dev.lemoyne.comfort.WelcomeDaemon" "$(cat "$R/data/hmgapi/state/services.txt")"
+check "no starter script registered in services.txt" no "$(grep -q 'hmgapi-comfort starter' "$R/data/hmgapi/state/services.txt" 2>/dev/null && echo yes || echo no)"
 for cmd in startup_notice seat_heat seat_vent wheel_heat; do
     has "$cmd in commands.txt" "hmgapi-comfort $cmd" "$(cat "$R/data/hmgapi/state/commands.txt")"
 done

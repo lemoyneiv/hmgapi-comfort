@@ -116,6 +116,13 @@ public final class ComfortService extends Service {
     }
 
     private void checkEnabledAndReload() {
+        String stateJson = ComfortPolicy.readSmallTextFile("/data/hmgapi/public/state.json");
+        if (!stateJson.isEmpty() && !ComfortPolicy.isModDisabledInPublicState(stateJson, "hmgapi-comfort")) {
+            if (engine != null) {
+                engine.requestSettingsReload();
+            }
+            return;
+        }
         Thread t = new Thread("ComfortStateCheck") {
             @Override
             public void run() {

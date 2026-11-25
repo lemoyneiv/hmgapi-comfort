@@ -1,7 +1,7 @@
 {
   "id": "hmgapi-comfort",
   "name": "Comfort & Startup",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "hmgapi": ">=1.0.0",
   "authors": ["lemoyneiv"],
   "license": "AGPL-3.0",
@@ -21,15 +21,8 @@
       "jar": "app/Comfort.apk",
       "class": "dev.lemoyne.comfort.WelcomeDaemon",
       "user": "system",
-      "start": "boot",
-      "restart": true
-    },
-    {
-      "name": "starter",
-      "script": "svc/start.sh",
-      "user": "system",
       "start": "android",
-      "restart": false
+      "restart": true
     }
   ],
   "vehicle": {

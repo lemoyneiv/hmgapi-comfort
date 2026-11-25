@@ -11,7 +11,7 @@ Automatically dismisses the infotainment startup confirmation screen across cold
 ## Features
 
 - **Instant Startup Confirmation Dismissal (`WelcomeDaemon`)**
-  - Lightweight boot-stage daemon (`start: "boot"`) that dismisses the infotainment consent notice within milliseconds of `sys.boot_completed=1` on cold boot and within `150 ms` on QuickBoot suspend-to-RAM resume—only while safely in Park (`P`).
+  - Lightweight Android-stage daemon (`start: "android"`) that dismisses the infotainment consent notice right after `sys.boot_completed=1` on cold boot and within `200 ms` on QuickBoot suspend-to-RAM resume—only while safely in Park (`P`), while deferring background climate service startup by `12 s` on cold boot so Wireless CarPlay / Android Auto connects with zero IPC contention and staying dormant during dark/silent parked wakes.
   - Configurable **Dismiss Delay (`0–2500 ms`)** if you prefer a brief pause after wake.
 - **3-Tier Cold-Weather Seat & Steering Wheel Warming**
   - Automatic **Metric (`°C`) & Imperial (`°F`) Vehicle Unit Support**: detects your car's active temperature unit setting (`°C` or `°F`) automatically, displays live outside temperature and seasonal spectrum ranges in your preferred unit, and steps thresholds in whole `1 °C` or `1 °F` increments (defaults: `≤ -4 °C` / `25 °F` → L3, `≤ 3 °C` / `38 °F` → L2, `≤ 10 °C` / `50 °F` → L1, plus independent **Steering Wheel Heat** at `≤ 7 °C` / `45 °F`).

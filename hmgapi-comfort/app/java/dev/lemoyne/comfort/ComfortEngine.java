@@ -11,6 +11,7 @@ import hmgapi.client.HmgApi;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.File;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -27,7 +28,11 @@ import java.util.Map;
  */
 public final class ComfortEngine {
     private static final String TAG = "HmgComfort";
+    private static final String MOD_ID = "hmgapi-comfort";
     private static final String HW_PREFS = "comfort_hw_caps";
+    private static final File STATE_FILE = new File("/data/hmgapi/public/state.json");
+    private static final File OPENLINK_BT_FILE = new File("/dev/.openlink-bt");
+    private static final long COLD_BOOT_UPTIME_GUARD_MS = 26_000L;
     static final String[] READ_KEYS = {
         "hv.ready", "gear.park", "charging", "outside_temp_f", "outside_temp", "wheel_heat",
         "seat_heat.driver", "seat_heat.passenger", "seat_heat.rear_left", "seat_heat.rear_right",
@@ -185,6 +190,9 @@ public final class ComfortEngine {
     private volatile boolean forceWelcomeRun;
     private volatile boolean mobisAwake = true;
     private volatile boolean uiForeground;
+    private final Object wakeLock = new Object();
+    private boolean wakeSignaled;
+    private long lastStateMtime = -1L;
     private Thread worker;
     private int welcomeAttempts;
     private int outOfParkWelcomeChecks;
@@ -288,6 +296,7 @@ public final class ComfortEngine {
 
     public synchronized void stop() {
         running = false;
+        wakeWorker();
         if (worker != null) {
             worker.interrupt();
             worker = null;
@@ -407,14 +416,79 @@ public final class ComfortEngine {
         return cabin;
     }
 
-    private synchronized void wakeWorker() {
-        if (worker != null) worker.interrupt();
+    private void wakeWorker() {
+        synchronized (wakeLock) {
+            wakeSignaled = true;
+            wakeLock.notifyAll();
+        }
+    }
+
+    private void waitQuietly(long ms) {
+        if (ms <= 0L) return;
+        synchronized (wakeLock) {
+            if (!wakeSignaled && running) {
+                try {
+                    wakeLock.wait(ms);
+                } catch (InterruptedException ignored) {
+                }
+            }
+            wakeSignaled = false;
+        }
+    }
+
+    private boolean refreshFromPublicStateFile() {
+        long mtime = STATE_FILE.isFile() ? STATE_FILE.lastModified() : 0L;
+        if (mtime <= 0L) return false;
+        if (!reloadSettings && mtime == lastStateMtime) {
+            return false;
+        }
+        String raw = ComfortPolicy.readSmallTextFile(STATE_FILE.getAbsolutePath());
+        if (raw.isEmpty()) return false;
+        if (ComfortPolicy.isModDisabledInPublicState(raw, MOD_ID)) {
+            lastStateMtime = mtime;
+            return true;
+        }
+        try {
+            JSONObject root = new JSONObject(raw);
+            JSONObject mods = root.optJSONObject("mods");
+            JSONObject mod = mods == null ? null : mods.optJSONObject(MOD_ID);
+            JSONObject s = mod == null ? null : mod.optJSONObject("settings");
+            if (s != null) {
+                config = parseConfig(s);
+                reloadSettings = false;
+                lastStateMtime = mtime;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
     }
 
     private void loop() {
         Log.i(TAG, "[hmgapi-comfort] background coordinator started");
+        boolean firstColdTick = true;
         while (running) {
             try {
+                // Dormant standby: zero @hmgapi IPC and zero OEM Binder queries while screen is off / silent wake
+                boolean darkStandby = !uiForeground
+                        && !forceClimateRun
+                        && !forceWelcomeRun
+                        && !"1".equals(lastReadings.get("hv.ready"))
+                        && (OPENLINK_BT_FILE.isFile() || (!mobisAwake && !isDisplayOn()));
+                if (darkStandby) {
+                    waitQuietly(15_000L);
+                    continue;
+                }
+
+                // Honor the cold-boot AA/CarPlay connection runway unless the Comfort UI is open
+                if (!uiForeground
+                        && !forceClimateRun
+                        && !forceWelcomeRun
+                        && SystemClock.elapsedRealtime() < COLD_BOOT_UPTIME_GUARD_MS
+                        && !ComfortPolicy.isProjectionTcpConnected()) {
+                    waitQuietly(2000L);
+                    continue;
+                }
+
                 long now = SystemClock.elapsedRealtime();
                 long sleepGap = now - SystemClock.uptimeMillis();
                 long wakeSeq = WelcomeDaemon.readWakeSeq();
@@ -436,6 +510,22 @@ public final class ComfortEngine {
                 welcomeTracker.onSuspendCheck(sleepGap, now);
                 welcomeTracker.onWakeSeqCheck(wakeSeq, now);
 
+                if (refreshFromPublicStateFile()) {
+                    connected = false;
+                    notifyListeners();
+                    waitQuietly(5000L);
+                    continue;
+                }
+
+                if (firstColdTick) {
+                    firstColdTick = false;
+                    if (!forceWelcomeRun && occupancyClient.pingDaemon()) {
+                        // WelcomeDaemon already owns cold-boot dismissal; skip duplicate @hmgapi command
+                        welcomeTracker.markDone();
+                        lastWelcomeStatus = stamp("Dismissed on start (fast-path)");
+                    }
+                }
+
                 if (seatCaps.frontVent == -1 || seatCaps.rearLeftHeat == -1 || seatCaps.rearRightHeat == -1
                         || tempUnit == OccupantSignalProbe.TEMP_UNIT_UNKNOWN) {
                     OccupantSignalProbe.CabinState earlyCabin = occupancyClient.queryCabinState();
@@ -446,28 +536,30 @@ public final class ComfortEngine {
                 }
 
                 HmgApi api = HmgApi.connect().timeout(5000);
-                HmgApi.Result who;
-                try {
-                    who = api.call("whoami");
-                } catch (IOException e) {
-                    connected = false;
-                    notifyListeners();
-                    sleepQuietly(1200);
-                    continue;
+                if (!connected) {
+                    HmgApi.Result who;
+                    try {
+                        who = api.call("whoami");
+                    } catch (IOException e) {
+                        connected = false;
+                        notifyListeners();
+                        waitQuietly(1500L);
+                        continue;
+                    }
+                    String whoText = who.text == null ? "" : who.text.trim();
+                    if (who.code == 13) {
+                        connected = false;
+                        notifyListeners();
+                        waitQuietly(5000L);
+                        continue;
+                    }
+                    if (who.code != 0 || "root".equals(whoText) || whoText.isEmpty()) {
+                        // Transient hmgapid MAX_WORKERS busy (code 75): back off briefly without dropping state
+                        waitQuietly(800L);
+                        continue;
+                    }
+                    connected = true;
                 }
-                String whoText = who.text == null ? "" : who.text.trim();
-                if (who.code == 13) {
-                    connected = false;
-                    notifyListeners();
-                    sleepQuietly(5000);
-                    continue;
-                }
-                if (who.code != 0 || "root".equals(whoText) || whoText.isEmpty()) {
-                    // Transient hmgapid MAX_WORKERS busy (code 75): back off briefly without dropping state
-                    sleepQuietly(800);
-                    continue;
-                }
-                connected = true;
 
                 if (reloadSettings) {
                     try {
@@ -478,15 +570,22 @@ public final class ComfortEngine {
                     }
                 }
 
-                // 1. Startup safety notice auto-dismiss BEFORE vehicle telemetry read so IPC latency never delays it
+                // 1. Startup safety notice fallback dismissal (give WelcomeDaemon 600 ms head start on wake)
+                int effectiveWelcomeDelay = Math.max(config.welcomeDelayMs, 600);
                 if (forceWelcomeRun || (config.welcomeDismiss
-                        && welcomeTracker.readyToDismiss(SystemClock.elapsedRealtime(), config.welcomeDelayMs))) {
+                        && welcomeTracker.readyToDismiss(SystemClock.elapsedRealtime(), effectiveWelcomeDelay))) {
                     boolean manual = forceWelcomeRun;
                     forceWelcomeRun = false;
                     handleWelcome(api, manual);
                 }
 
-                OccupantSignalProbe.CabinState cabin = readMergedTelemetry(api);
+                OccupantSignalProbe.CabinState cabin;
+                try {
+                    cabin = readMergedTelemetry(api);
+                } catch (IOException e) {
+                    connected = false;
+                    throw e;
+                }
                 Map<String, String> v = lastReadings;
 
                 if (cabin.mobisSleeping == 1) {
@@ -553,12 +652,14 @@ public final class ComfortEngine {
                 notifyListeners();
                 long pollSleepMs = (config.welcomeDismiss && welcomeTracker.isPending())
                         ? 400L
-                        : ((uiForeground || showingAccStandbyNote) ? 1200L : 2500L);
-                sleepQuietly(pollSleepMs);
+                        : ((uiForeground || showingAccStandbyNote)
+                                ? 1200L
+                                : (driveTracker.isCompleted() ? 3500L : 2500L));
+                waitQuietly(pollSleepMs);
             } catch (Throwable t) {
                 Log.w(TAG, "[hmgapi-comfort] loop error: " + t);
                 notifyListeners();
-                sleepQuietly(1500);
+                waitQuietly(1500L);
             }
         }
         Log.i(TAG, "[hmgapi-comfort] background coordinator stopped");
