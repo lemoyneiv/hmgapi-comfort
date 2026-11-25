@@ -680,8 +680,16 @@ public final class ComfortPolicyTest {
                 metricBoarding.summary + " -> " + actions(metricBoarding.actions));
 
         // 24. Cold-boot projection runway, silent dark-standby gating, /proc/net/tcp & public state.json
-        check("Silent standby: ignOn=1 never suppresses comfort even if OpenLink marker or blackscreen",
-                false, ComfortPolicy.isSilentParkedStandby(true, 6, 1, 1));
+        check("Silent standby: Bluelink Remote Climate (pwrSt=6, mobisSleeping=1, ignOn=1, standalone) stays silent to preserve startup_notice",
+                true, ComfortPolicy.isSilentParkedStandby(false, 6, 1, 1));
+        check("Silent standby: Bluelink Remote Climate (pwrSt=6, mobisSleeping=1, ignOn=1, with standby marker) stays silent",
+                true, ComfortPolicy.isSilentParkedStandby(true, 6, 1, 1));
+        check("Silent standby: pressing Start after Remote Climate (pwrSt=0, mobisSleeping=0, ignOn=1) wakes immediately",
+                false, ComfortPolicy.isSilentParkedStandby(false, 0, 0, 1));
+        check("Silent standby: active drive with Radio/AV-Off (pwrSt=0, mobisSleeping=1, ignOn=1) stays active",
+                false, ComfortPolicy.isSilentParkedStandby(false, 0, 1, 1));
+        check("Silent standby: active drive (pwrSt=0, ignOn=1) overrides stale standby marker",
+                false, ComfortPolicy.isSilentParkedStandby(true, 0, 0, 1));
         check("Silent standby: OpenLink /dev/.openlink-bt marker suppresses parked silent wake",
                 true, ComfortPolicy.isSilentParkedStandby(true, -1, 0, 0));
         check("Silent standby: Mobis BlackScreen/AV-Off (mobisSleeping=1, ignOn=0) is silent",

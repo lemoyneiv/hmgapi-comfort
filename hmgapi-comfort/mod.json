@@ -1,7 +1,7 @@
 {
   "id": "hmgapi-comfort",
   "name": "Comfort & Startup",
-  "version": "1.1.9",
+  "version": "1.1.10",
   "hmgapi": ">=1.0.0",
   "authors": ["lemoyneiv"],
   "license": "AGPL-3.0",

@@ -886,14 +886,19 @@ public final class ComfortPolicy {
     /**
      * True when the vehicle is in a silent parked wake or Mobis dark standby where neither the
      * startup notice dismisser nor background cabin/IPC polling should run:
-     *  - Never true when BCM Ignition ({@code ignOn == 1}) is ON (active drive, Utility Mode, or plugged-in IG ON).
-     *  - True when OpenLink's dark-standby marker ({@code /dev/.openlink-bt}) is present.
-     *  - True when Mobis BlackScreen or AV-PowerOff ({@code mobisSleeping == 1}) is active.
-     *  - True when OEM Micom power status is OFF (2), DELAY_MODE (6), or PREPARING_OFF (7) unless
-     *    the display is confirmed awake ({@code mobisSleeping == 0}, e.g. driver entry welcome screen).
+     *  - When OEM Micom power status is OFF (2), DELAY_MODE (6), or PREPARING_OFF (7)—including
+     *    unoccupied Bluelink Remote Climate Preconditioning ({@code powerStatus == 6, ignOn == 1,
+     *    mobisSleeping == 1})—true unless the display is confirmed awake ({@code mobisSleeping == 0}).
+     *  - Otherwise never true when BCM Ignition ({@code ignOn == 1}) is ON (active drive even with
+     *    Radio/AV-Off, Utility Mode, or plugged-in IG ON).
+     *  - True when a parked standby marker ({@code /dev/.openlink-bt}) is present or Mobis
+     *    BlackScreen / AV-PowerOff ({@code mobisSleeping == 1}) is active with {@code ignOn != 1}.
      */
     public static boolean isSilentParkedStandby(
             boolean openLinkBtMarker, int powerStatus, int mobisSleeping, int ignOn) {
+        if (powerStatus == 2 || powerStatus == 6 || powerStatus == 7) {
+            return mobisSleeping != 0;
+        }
         if (ignOn == 1) {
             return false;
         }
@@ -902,9 +907,6 @@ public final class ComfortPolicy {
         }
         if (mobisSleeping == 1) {
             return true;
-        }
-        if (powerStatus == 2 || powerStatus == 6 || powerStatus == 7) {
-            return mobisSleeping != 0;
         }
         return false;
     }

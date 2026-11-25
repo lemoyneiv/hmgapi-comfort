@@ -26,6 +26,7 @@ has "apk contains BootReceiver" "Ldev/lemoyne/comfort/BootReceiver;" "$DEX_STRIN
 has "apk contains OccupantSignalProbe" "Ldev/lemoyne/comfort/OccupantSignalProbe;" "$DEX_STRINGS"
 has "apk contains CabinPushBridge" "Ldev/lemoyne/comfort/CabinPushBridge;" "$DEX_STRINGS"
 check "apk omits removed ComfortUsbExporter" no "$(echo "$DEX_STRINGS" | grep -q 'Ldev/lemoyne/comfort/ComfortUsbExporter;' && echo yes || echo no)"
+check "manifest omits BOOT_COMPLETED broadcast wake" no "$(grep -q 'BOOT_COMPLETED' "$M/app/AndroidManifest.xml" && echo yes || echo no)"
 has "apk bundles HmgApi client" "Lhmgapi/client/HmgApi;" "$DEX_STRINGS"
 
 for ic in icon.png icon_night.png icon_disabled.png icon_disabled_night.png; do

@@ -9,9 +9,8 @@ import java.io.File;
 
 /**
  * Starts {@link ComfortService} on QuickBoot Mobis SCREEN_ON, APK update, or live mod enablement.
- * Uses zero-IPC public {@code state.json} reads and defers cold-boot {@code BOOT_COMPLETED} /
- * {@code STATE_CHANGED} starts to {@link WelcomeDaemon}'s post-runway Binder launch so Wireless
- * Android Auto / CarPlay connects without broadcast-queue or {@code @hmgapi} contention.
+ * Cold-boot startup is owned solely by {@link WelcomeDaemon} (post-runway Binder launch) so neither
+ * late {@code BOOT_COMPLETED} broadcast queues nor silent parked wakes spawn {@code ComfortService}.
  */
 public final class BootReceiver extends BroadcastReceiver {
     private static final String MOD_ID = "hmgapi-comfort";
@@ -24,12 +23,16 @@ public final class BootReceiver extends BroadcastReceiver {
         if (context == null) return;
         if (OPENLINK_BT_FILE.isFile()) return;
 
+        final String action = intent == null ? null : intent.getAction();
+        if (Intent.ACTION_BOOT_COMPLETED.equals(action)) {
+            return;
+        }
+
         String stateJson = ComfortPolicy.readSmallTextFile(STATE_PATH);
         if (ComfortPolicy.isModDisabledInPublicState(stateJson, MOD_ID)) {
             return;
         }
 
-        final String action = intent == null ? null : intent.getAction();
         if (!Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)
                 && SystemClock.elapsedRealtime() < COLD_BOOT_UPTIME_GUARD_MS
                 && !ComfortPolicy.isProjectionTcpConnected()) {
