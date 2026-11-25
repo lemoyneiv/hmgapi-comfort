@@ -24,4 +24,4 @@ jobs:
           test "$w" = "$s" || { echo "ci.yml calls mod.yml@$w, hmgapi-sdk.json pins $s"; exit 1; }
 
   mod:
-    uses: Open-HMG/HMG-API/.github/workflows/mod.yml@v1.1.0-rc.3
+    uses: Open-HMG/HMG-API/.github/workflows/mod.yml@v1.1.0-rc.9
