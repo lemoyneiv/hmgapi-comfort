@@ -773,6 +773,54 @@ public final class ComfortPolicyTest {
             check("LoopbackServer msSinceLastClient test threw no exception", "none", e.toString());
         }
 
+        // 25. SettingsSyncGuard: rapid +/- stepper debouncing & stale public/state.json race protection
+        ComfortPolicy.SettingsSyncGuard guard = new ComfortPolicy.SettingsSyncGuard();
+        check("SettingsSyncGuard: initial mtime=1000 is detected as changed",
+                true, guard.hasPublicStateMtimeChanged(1000L));
+        guard.recordPublicStateMtime(1000L);
+        check("SettingsSyncGuard: unchanged mtime=1000 is not re-read",
+                false, guard.hasPublicStateMtimeChanged(1000L));
+
+        ComfortConfig step1 = def.withAdjustedThreshold(1, 1, false);  // 38 -> 39 F
+        ComfortConfig step2 = step1.withAdjustedThreshold(1, 1, false); // 39 -> 40 F
+        ComfortConfig step3 = step2.withAdjustedThreshold(1, 1, false); // 40 -> 41 F
+        long s1 = guard.onLocalEdit(step1, 1_000L);
+        long s2 = guard.onLocalEdit(step2, 1_100L);
+        long s3 = guard.onLocalEdit(step3, 1_200L);
+        check("SettingsSyncGuard: rapid taps increment monotonic configSeq (1,2,3)",
+                "1/2/3", s1 + "/" + s2 + "/" + s3);
+        check("SettingsSyncGuard: debounce holds save until 250 ms after final tap",
+                null, guard.takeDueSave(1_350L));
+        check("SettingsSyncGuard: blocks stale public/state.json and direct reads while debounce pending",
+                "false/false/true",
+                guard.canApplyPublicStateSettings(1_350L, s3)
+                        + "/" + guard.canApplyDirectSettings(s3)
+                        + "/" + guard.isSettlingLocalSave(1_350L));
+
+        ComfortConfig due = guard.takeDueSave(1_450L);
+        check("SettingsSyncGuard: coalesces 3 rapid taps into single 41 F save",
+                41, due == null ? -1 : due.heatMedF);
+        check("SettingsSyncGuard: blocks reads while save RPC is in flight",
+                "false/false",
+                guard.canApplyPublicStateSettings(1_460L, s3) + "/" + guard.canApplyDirectSettings(s3));
+
+        guard.onSaveFinished(1_480L);
+        check("SettingsSyncGuard: blocks lagging publish-state state.json during 4 s settle window",
+                "false/true",
+                guard.canApplyPublicStateSettings(2_500L, s3) + "/" + guard.isSettlingLocalSave(2_500L));
+        check("SettingsSyncGuard: rejects direct settings RPC that started before a newer tap",
+                false, guard.canApplyDirectSettings(s2));
+        check("SettingsSyncGuard: allows direct settings RPC matching latest seq after save finishes",
+                true, guard.canApplyDirectSettings(s3));
+        check("SettingsSyncGuard: accepts external public/state.json once 4 s settle window expires",
+                "true/false",
+                guard.canApplyPublicStateSettings(5_500L, s3) + "/" + guard.isSettlingLocalSave(5_500L));
+
+        guard.onLocalEdit(step1, 6_000L);
+        guard.requestImmediateFlush(6_020L);
+        check("SettingsSyncGuard: onPause immediate flush makes pending save due immediately",
+                0L, guard.msUntilNextSave(6_020L));
+
         System.exit(fail);
     }
 }

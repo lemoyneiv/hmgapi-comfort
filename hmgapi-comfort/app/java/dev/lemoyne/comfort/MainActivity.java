@@ -129,7 +129,8 @@ public final class MainActivity extends Activity implements ComfortEngine.Listen
                 ? android.R.style.Theme_Holo_NoActionBar
                 : android.R.style.Theme_Holo_Light_NoActionBar);
         super.onCreate(savedInstanceState);
-        startService(new Intent(this, ComfortService.class));
+        startService(new Intent(this, ComfortService.class)
+                .setAction(ComfortService.ACTION_ENSURE_RUNNING));
         engine = ComfortEngine.getInstance(this);
         ComfortEngine.Snapshot initSnap = engine.snapshot();
         current = initSnap.config;
@@ -155,6 +156,7 @@ public final class MainActivity extends Activity implements ComfortEngine.Listen
     @Override
     protected void onPause() {
         if (engine != null) {
+            engine.flushPendingSettingsSave();
             engine.setUiForeground(false);
             engine.removeListener(this);
         }
@@ -893,17 +895,9 @@ public final class MainActivity extends Activity implements ComfortEngine.Listen
     private void save(final ComfortConfig next) {
         current = next;
         updateControls(next);
-        Thread t = new Thread("ComfortSave") {
-            @Override
-            public void run() {
-                try {
-                    HmgApi.connect().timeout(3000).saveSettings(ComfortEngine.toJson(next));
-                    if (engine != null) engine.requestSettingsReload();
-                } catch (Throwable ignored) {}
-            }
-        };
-        t.setDaemon(true);
-        t.start();
+        if (engine != null) {
+            engine.applyUserConfig(next);
+        }
     }
 
     private void applyHardwareCapabilities() {
@@ -970,7 +964,9 @@ public final class MainActivity extends Activity implements ComfortEngine.Listen
     }
 
     private void render(ComfortEngine.Snapshot s) {
-        current = s.config;
+        if (engine == null || s.configSeq >= engine.getConfigSeq()) {
+            current = s.config;
+        }
         Map<String, String> r = s.readings;
         latestPresence = s.passengerPresence == null
                 ? OccupantSignalProbe.PassengerPresence.UNAVAILABLE

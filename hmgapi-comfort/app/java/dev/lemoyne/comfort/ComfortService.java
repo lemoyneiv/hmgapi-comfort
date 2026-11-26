@@ -92,6 +92,8 @@ public final class ComfortService extends Service {
                 engine.onScreenOn();
             } else if (ACTION_ENSURE_RUNNING.equals(act)) {
                 engine.onSupervisorPing();
+            } else if (HmgApi.ACTION_STATE_CHANGED.equals(act)) {
+                checkEnabledAndReload();
             } else {
                 engine.requestSettingsReload();
             }
@@ -119,7 +121,7 @@ public final class ComfortService extends Service {
         String stateJson = ComfortPolicy.readSmallTextFile("/data/hmgapi/public/state.json");
         if (!stateJson.isEmpty() && !ComfortPolicy.isModDisabledInPublicState(stateJson, "hmgapi-comfort")) {
             if (engine != null) {
-                engine.requestSettingsReload();
+                engine.onExternalStateChanged();
             }
             return;
         }
@@ -138,7 +140,7 @@ public final class ComfortService extends Service {
                         return;
                     }
                     if (engine != null) {
-                        engine.requestSettingsReload();
+                        engine.onExternalStateChanged();
                     }
                 } catch (Throwable ignored) {}
             }

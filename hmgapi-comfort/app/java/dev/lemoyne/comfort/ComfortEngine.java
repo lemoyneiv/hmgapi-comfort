@@ -54,6 +54,7 @@ public final class ComfortEngine {
         public final String lastWelcomeStatus;
         public final boolean connected;
         public final boolean metricUnits;
+        public final long configSeq;
 
         Snapshot(
                 ComfortConfig config,
@@ -65,7 +66,7 @@ public final class ComfortEngine {
                 String lastWelcomeStatus,
                 boolean connected) {
             this(config, readings, passengerPresence, cabinState, seatCaps,
-                    lastClimateStatus, lastWelcomeStatus, connected, false);
+                    lastClimateStatus, lastWelcomeStatus, connected, false, 0L);
         }
 
         Snapshot(
@@ -78,6 +79,21 @@ public final class ComfortEngine {
                 String lastWelcomeStatus,
                 boolean connected,
                 boolean metricUnits) {
+            this(config, readings, passengerPresence, cabinState, seatCaps,
+                    lastClimateStatus, lastWelcomeStatus, connected, metricUnits, 0L);
+        }
+
+        Snapshot(
+                ComfortConfig config,
+                Map<String, String> readings,
+                OccupantSignalProbe.PassengerPresence passengerPresence,
+                OccupantSignalProbe.CabinState cabinState,
+                OccupantSignalProbe.SeatCapabilities seatCaps,
+                String lastClimateStatus,
+                String lastWelcomeStatus,
+                boolean connected,
+                boolean metricUnits,
+                long configSeq) {
             this.config = config;
             this.readings = readings;
             this.passengerPresence = passengerPresence == null
@@ -93,6 +109,7 @@ public final class ComfortEngine {
             this.lastWelcomeStatus = lastWelcomeStatus;
             this.connected = connected;
             this.metricUnits = metricUnits;
+            this.configSeq = configSeq;
         }
     }
 
@@ -191,9 +208,12 @@ public final class ComfortEngine {
     private volatile boolean mobisAwake = true;
     private volatile boolean uiForeground;
     private final Object wakeLock = new Object();
+    private final ComfortPolicy.SettingsSyncGuard syncGuard =
+            new ComfortPolicy.SettingsSyncGuard();
     private boolean wakeSignaled;
-    private long lastStateMtime = -1L;
+    private boolean lastPublicStateDisabled;
     private Thread worker;
+    private Thread saveWorker;
     private int welcomeAttempts;
     private int outOfParkWelcomeChecks;
     private int tempTimeoutRetries;
@@ -206,6 +226,8 @@ public final class ComfortEngine {
         this.appContext = appContext;
         this.seatCaps = loadCachedSeatCapabilities(appContext);
         this.tempUnit = loadCachedTempUnit(appContext);
+        refreshFromPublicStateFile();
+        this.reloadSettings = true;
     }
 
     private static OccupantSignalProbe.SeatCapabilities loadCachedSeatCapabilities(Context ctx) {
@@ -295,6 +317,7 @@ public final class ComfortEngine {
     }
 
     public synchronized void stop() {
+        flushPendingSettingsSave();
         running = false;
         wakeWorker();
         if (worker != null) {
@@ -316,10 +339,107 @@ public final class ComfortEngine {
         }
     }
 
+    public long getConfigSeq() {
+        return syncGuard.getConfigSeq();
+    }
+
     public Snapshot snapshot() {
-        return new Snapshot(config, new LinkedHashMap<String, String>(lastReadings),
+        ComfortConfig cfg;
+        long seq;
+        synchronized (syncGuard) {
+            cfg = config;
+            seq = syncGuard.getConfigSeq();
+        }
+        return new Snapshot(cfg, new LinkedHashMap<String, String>(lastReadings),
                 lastPassengerPresence, lastCabinState, seatCaps,
-                lastClimateStatus, lastWelcomeStatus, connected, isMetricUnits());
+                lastClimateStatus, lastWelcomeStatus, connected, isMetricUnits(), seq);
+    }
+
+    /**
+     * Updates in-memory configuration immediately on UI edit and schedules a single
+     * debounced {@code setting-set} write so rapid stepper taps never snap back or
+     * spawn concurrent {@code Engine publish-state} Dalvik forks.
+     */
+    public void applyUserConfig(ComfortConfig next) {
+        if (next == null) return;
+        synchronized (syncGuard) {
+            this.config = next;
+            this.reloadSettings = false;
+            syncGuard.onLocalEdit(next, SystemClock.elapsedRealtime());
+            ensureSaveWorkerLocked();
+            syncGuard.notifyAll();
+        }
+    }
+
+    public void flushPendingSettingsSave() {
+        synchronized (syncGuard) {
+            if (!syncGuard.hasPendingOrInFlightSave()) {
+                return;
+            }
+            syncGuard.requestImmediateFlush(SystemClock.elapsedRealtime());
+            ensureSaveWorkerLocked();
+            syncGuard.notifyAll();
+        }
+    }
+
+    private void ensureSaveWorkerLocked() {
+        if (saveWorker != null && saveWorker.isAlive()) {
+            return;
+        }
+        saveWorker = new Thread("ComfortSettingsSaver") {
+            @Override
+            public void run() {
+                runSaveLoop();
+            }
+        };
+        saveWorker.setDaemon(true);
+        saveWorker.start();
+    }
+
+    private void runSaveLoop() {
+        while (true) {
+            ComfortConfig toWrite;
+            synchronized (syncGuard) {
+                long waitMs = syncGuard.msUntilNextSave(SystemClock.elapsedRealtime());
+                if (waitMs < 0L) {
+                    saveWorker = null;
+                    return;
+                }
+                if (waitMs > 0L) {
+                    try {
+                        syncGuard.wait(waitMs);
+                    } catch (InterruptedException ignored) {
+                    }
+                    continue;
+                }
+                toWrite = syncGuard.takeDueSave(SystemClock.elapsedRealtime());
+                if (toWrite == null) {
+                    continue;
+                }
+            }
+
+            try {
+                JSONObject payload = toJson(toWrite);
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    try {
+                        HmgApi.connect().timeout(3000).saveSettings(payload);
+                        break;
+                    } catch (Throwable err) {
+                        if (attempt == 0 && syncGuard.msUntilNextSave(SystemClock.elapsedRealtime()) < 0L) {
+                            sleepQuietly(300);
+                        } else {
+                            Log.w(TAG, "[hmgapi-comfort] settings save failed: " + err);
+                        }
+                    }
+                }
+            } catch (Throwable err) {
+                Log.w(TAG, "[hmgapi-comfort] settings encode failed: " + err);
+            } finally {
+                synchronized (syncGuard) {
+                    syncGuard.onSaveFinished(SystemClock.elapsedRealtime());
+                }
+            }
+        }
     }
 
     public void setUiForeground(boolean foreground) {
@@ -363,6 +483,17 @@ public final class ComfortEngine {
     }
 
     public void requestSettingsReload() {
+        if (syncGuard.hasPendingOrInFlightSave()) {
+            return;
+        }
+        reloadSettings = true;
+        wakeWorker();
+    }
+
+    public void onExternalStateChanged() {
+        if (syncGuard.isSettlingLocalSave(SystemClock.elapsedRealtime())) {
+            return;
+        }
         reloadSettings = true;
         wakeWorker();
     }
@@ -439,14 +570,19 @@ public final class ComfortEngine {
     private boolean refreshFromPublicStateFile() {
         long mtime = STATE_FILE.isFile() ? STATE_FILE.lastModified() : 0L;
         if (mtime <= 0L) return false;
-        if (!reloadSettings && mtime == lastStateMtime) {
-            return false;
+        if (!syncGuard.hasPublicStateMtimeChanged(mtime)) {
+            return lastPublicStateDisabled;
         }
+        long seqBefore = syncGuard.getConfigSeq();
         String raw = ComfortPolicy.readSmallTextFile(STATE_FILE.getAbsolutePath());
         if (raw.isEmpty()) return false;
-        if (ComfortPolicy.isModDisabledInPublicState(raw, MOD_ID)) {
-            lastStateMtime = mtime;
+        syncGuard.recordPublicStateMtime(mtime);
+        lastPublicStateDisabled = ComfortPolicy.isModDisabledInPublicState(raw, MOD_ID);
+        if (lastPublicStateDisabled) {
             return true;
+        }
+        if (!syncGuard.canApplyPublicStateSettings(SystemClock.elapsedRealtime(), seqBefore)) {
+            return false;
         }
         try {
             JSONObject root = new JSONObject(raw);
@@ -454,9 +590,14 @@ public final class ComfortEngine {
             JSONObject mod = mods == null ? null : mods.optJSONObject(MOD_ID);
             JSONObject s = mod == null ? null : mod.optJSONObject("settings");
             if (s != null) {
-                config = parseConfig(s);
-                reloadSettings = false;
-                lastStateMtime = mtime;
+                ComfortConfig parsed = parseConfig(s);
+                synchronized (syncGuard) {
+                    if (syncGuard.canApplyPublicStateSettings(SystemClock.elapsedRealtime(), seqBefore)) {
+                        config = parsed;
+                        syncGuard.onExternalSettingsApplied();
+                        reloadSettings = false;
+                    }
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -562,11 +703,22 @@ public final class ComfortEngine {
                 }
 
                 if (reloadSettings) {
-                    try {
-                        config = parseConfig(api.settings());
+                    if (syncGuard.hasPendingOrInFlightSave()) {
                         reloadSettings = false;
-                    } catch (IOException e) {
-                        Log.w(TAG, "[hmgapi-comfort] settings read retry later: " + e);
+                    } else {
+                        long seqBefore = syncGuard.getConfigSeq();
+                        try {
+                            ComfortConfig parsed = parseConfig(api.settings());
+                            synchronized (syncGuard) {
+                                if (syncGuard.canApplyDirectSettings(seqBefore)) {
+                                    config = parsed;
+                                    syncGuard.onExternalSettingsApplied();
+                                }
+                                reloadSettings = false;
+                            }
+                        } catch (IOException e) {
+                            Log.w(TAG, "[hmgapi-comfort] settings read retry later: " + e);
+                        }
                     }
                 }
 

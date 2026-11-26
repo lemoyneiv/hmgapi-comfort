@@ -1068,4 +1068,95 @@ public final class ComfortPolicy {
             }
         }
     }
+
+    /**
+     * Coordinates optimistic in-app settings edits against asynchronous {@code hmgapid}
+     * {@code public/state.json} publishing and background telemetry snapshots so rapid
+     * UI stepper taps never snap back to stale {@code state.json} or pre-tap snapshots.
+     */
+    public static final class SettingsSyncGuard {
+        public static final long SAVE_DEBOUNCE_MS = 250L;
+        public static final long PUBLIC_STATE_SETTLE_MS = 4_000L;
+
+        private long configSeq;
+        private ComfortConfig pendingSave;
+        private long pendingSaveDueMs;
+        private boolean saveInFlight;
+        private long publicStateIgnoreUntilMs;
+        private long lastPublicStateMtime = -1L;
+
+        public synchronized long onLocalEdit(ComfortConfig next, long nowMs) {
+            configSeq++;
+            pendingSave = next;
+            pendingSaveDueMs = nowMs + SAVE_DEBOUNCE_MS;
+            publicStateIgnoreUntilMs = nowMs + SAVE_DEBOUNCE_MS + PUBLIC_STATE_SETTLE_MS;
+            return configSeq;
+        }
+
+        public synchronized void requestImmediateFlush(long nowMs) {
+            if (pendingSave != null && nowMs < pendingSaveDueMs) {
+                pendingSaveDueMs = nowMs;
+            }
+        }
+
+        public synchronized long getConfigSeq() {
+            return configSeq;
+        }
+
+        public synchronized boolean hasPendingOrInFlightSave() {
+            return pendingSave != null || saveInFlight;
+        }
+
+        public synchronized boolean isSettlingLocalSave(long nowMs) {
+            return pendingSave != null || saveInFlight || nowMs < publicStateIgnoreUntilMs;
+        }
+
+        public synchronized long msUntilNextSave(long nowMs) {
+            if (pendingSave == null) return -1L;
+            long rem = pendingSaveDueMs - nowMs;
+            return rem > 0L ? rem : 0L;
+        }
+
+        public synchronized ComfortConfig takeDueSave(long nowMs) {
+            if (pendingSave == null || nowMs < pendingSaveDueMs) {
+                return null;
+            }
+            ComfortConfig out = pendingSave;
+            pendingSave = null;
+            saveInFlight = true;
+            publicStateIgnoreUntilMs = Math.max(publicStateIgnoreUntilMs, nowMs + PUBLIC_STATE_SETTLE_MS);
+            return out;
+        }
+
+        public synchronized void onSaveFinished(long nowMs) {
+            saveInFlight = false;
+            publicStateIgnoreUntilMs = Math.max(publicStateIgnoreUntilMs, nowMs + PUBLIC_STATE_SETTLE_MS);
+        }
+
+        public synchronized boolean hasPublicStateMtimeChanged(long mtime) {
+            return mtime > 0L && mtime != lastPublicStateMtime;
+        }
+
+        public synchronized void recordPublicStateMtime(long mtime) {
+            if (mtime > 0L) {
+                lastPublicStateMtime = mtime;
+            }
+        }
+
+        public synchronized boolean canApplyPublicStateSettings(long nowMs, long seqAtReadStart) {
+            if (pendingSave != null || saveInFlight) return false;
+            if (configSeq != seqAtReadStart) return false;
+            return nowMs >= publicStateIgnoreUntilMs;
+        }
+
+        public synchronized boolean canApplyDirectSettings(long seqAtReadStart) {
+            if (pendingSave != null || saveInFlight) return false;
+            return configSeq == seqAtReadStart;
+        }
+
+        public synchronized long onExternalSettingsApplied() {
+            configSeq++;
+            return configSeq;
+        }
+    }
 }
